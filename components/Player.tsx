@@ -1,13 +1,24 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Exhibit, Mode } from "@/lib/engine";
+import type { Exhibit, Mode, Quality } from "@/lib/engine";
 import Legend from "./Legend";
 import { DURATION, FPS, SHOTS, blackAt, formatTime, shotAt } from "@/lib/shots";
 
 type Status = { kind: "loading"; progress: number } | { kind: "error"; message: string } | { kind: "ready" };
 
-const MODEL_URL = "/models/botai.glb";
+const QUALITY_KEY = "botai-quality";
+
+function initialQuality(): Quality {
+  if (typeof window === "undefined") return "low";
+  const q = new URLSearchParams(window.location.search).get("q");
+  if (q === "low" || q === "medium") return q;
+  try {
+    const saved = window.localStorage.getItem(QUALITY_KEY);
+    if (saved === "low" || saved === "medium") return saved;
+  } catch { /* storage may be blocked */ }
+  return "low";
+}
 
 const RESTART_AFTER = 6; // seconds of rest before the kiosk loop starts again
 
@@ -32,9 +43,15 @@ export default function Player() {
   const togglePanel = useCallback((p: "about") => setPanel((v) => (v === p ? null : p)), []);
   const [legend, setLegend] = useState(true);
   const [lens, setLensState] = useState(35);
+  const [quality, setQualityState] = useState<Quality>("low");
+  const [qualityReady, setQualityReady] = useState(false);
+  const resumeRef = useRef<{ time: number; playing: boolean } | null>(null);
 
-  // Boot the engine once per attempt.
+  useEffect(() => { setQualityState(initialQuality()); setQualityReady(true); }, []);
+
+  // Boot the engine once per attempt and per graphics quality.
   useEffect(() => {
+    if (!qualityReady) return;
     let disposed = false;
     const canvas = canvasRef.current;
     const view = viewRef.current;
@@ -47,7 +64,8 @@ export default function Player() {
       try {
         const { Exhibit } = await import("@/lib/engine");
         if (disposed) return;
-        engine = new Exhibit(canvas);
+        const { QUALITY } = await import("@/lib/engine");
+        engine = new Exhibit(canvas, quality);
         engineRef.current = engine;
         (window as unknown as { __exhibit?: Exhibit }).__exhibit = engine;
         ro = new ResizeObserver(() => {
@@ -55,12 +73,15 @@ export default function Player() {
           engine?.resize(Math.round(r.width), Math.round(r.height));
         });
         ro.observe(view);
-        await engine.load(MODEL_URL, (p) => !disposed && setStatus({ kind: "loading", progress: p }));
+        await engine.load(QUALITY[quality].model, (p) => !disposed && setStatus({ kind: "loading", progress: p }));
         if (disposed) return;
 
         const params = new URLSearchParams(window.location.search);
         const startShot = Number(params.get("shot"));
-        if (startShot >= 1 && startShot <= SHOTS.length) engine.seek(engine.shotStart(startShot));
+        const resume = resumeRef.current;
+        resumeRef.current = null;
+        if (resume) engine.seek(resume.time);
+        else if (startShot >= 1 && startShot <= SHOTS.length) engine.seek(engine.shotStart(startShot));
 
         let lastFrame = -1;
         engine.onTick = (t) => {
@@ -92,7 +113,9 @@ export default function Player() {
         engine.start();
         setStatus({ kind: "ready" });
         const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-        if (!reduce) { engine.play(); setPlaying(true); }
+        const autoplay = resume ? resume.playing : !reduce;
+        if (autoplay) { engine.play(); setPlaying(true); } else setPlaying(false);
+        setModeState("film");
       } catch (err) {
         if (disposed) return;
         const message = err instanceof Error ? err.message : String(err);
@@ -106,7 +129,18 @@ export default function Player() {
       engine?.dispose();
       engineRef.current = null;
     };
-  }, [attempt]);
+  }, [attempt, quality, qualityReady]);
+
+  const setQuality = useCallback((q: Quality) => {
+    if (q === quality) return;
+    const e = engineRef.current;
+    if (e) resumeRef.current = { time: e.current, playing: e.isPlaying };
+    try { window.localStorage.setItem(QUALITY_KEY, q); } catch { /* storage may be blocked */ }
+    const url = new URL(window.location.href);
+    url.searchParams.set("q", q);
+    window.history.replaceState(null, "", url);
+    setQualityState(q);
+  }, [quality]);
 
   const playingRef = useRef(playing);
   playingRef.current = playing;
@@ -183,6 +217,11 @@ export default function Player() {
     <div className="app">
       <header className="bar">
         <h1 className="bar__name title">Кремнёвый нож <span>Ботай, IV тыс. до н. э.</span></h1>
+        <span className="bar__label" aria-hidden="true">Графика</span>
+        <div className="seg" role="group" aria-label="Графика">
+          <button type="button" aria-pressed={quality === "low"} onClick={() => setQuality("low")} disabled={status.kind === "loading"}>Низкая</button>
+          <button type="button" aria-pressed={quality === "medium"} onClick={() => setQuality("medium")} disabled={status.kind === "loading"}>Средняя</button>
+        </div>
         <div className="seg" role="group" aria-label="Камера">
           <button type="button" aria-pressed={mode === "film"} onClick={() => setMode("film")} disabled={status.kind !== "ready"}>Фильм</button>
           <button type="button" aria-pressed={mode === "operator"} onClick={() => setMode("operator")} disabled={status.kind !== "ready"}>Оператор</button>
@@ -196,7 +235,7 @@ export default function Player() {
       <main className="stage">
         <div className="frame">
           <div className="frame__view" ref={viewRef} data-mode={mode}>
-            <canvas ref={canvasRef} aria-label="Трёхмерный фильм о кремнёвом ноже из поселения Ботай" />
+            <canvas key={quality} ref={canvasRef} aria-label="Трёхмерный фильм о кремнёвом ноже из поселения Ботай" />
             <div className="fade" ref={fadeRef} style={{ opacity: 0 }} />
 
             {showCaption && (
